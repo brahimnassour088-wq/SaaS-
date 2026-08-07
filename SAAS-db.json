@@ -1,0 +1,15 @@
+{
+  "commercants": {
+    "chez-brahim": {
+      "nom": "Chez Brahim",
+      "sel": "fb664c1d72cda2c79d625c97eacbd1dd",
+      "motDePasseHash": "8512ad5d30c1834e161bf2d8480edbbb2b6500ffc3219a8adbe8966e0e416f8296de3e8d03a4cc707d109dedb1a06ffa0af42306783ecfb6fb493777aa0e771a",
+      "produits": [
+        {
+          "nom": "Exemple de produit",
+          "prix": 1000
+        }
+      ]
+    }
+  }
+}
