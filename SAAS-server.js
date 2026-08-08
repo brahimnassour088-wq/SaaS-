@@ -1,0 +1,876 @@
+// ============================================================
+// SERVEUR DU SAAS "MENU QR CODE"
+// ============================================================
+// Ce fichier est "le code derrière" (le backend).
+// Il n'utilise QUE des outils déjà inclus dans Node.js
+// (pas besoin d'installer quoi que ce soit avec npm install
+// pour que ça tourne — donc pas besoin de carte bancaire).
+//
+// Ce que fait ce serveur :
+// 1. Il garde en mémoire, dans le fichier db.json, un "tiroir"
+//    par commerçant (ses produits, ses prix, son mot de passe).
+// 2. Il affiche une page publique par commerçant → c'est CETTE
+//    page que le QR code va pointer.
+// 3. Il donne à chaque commerçant un espace privé (dashboard)
+//    où il peut changer ses prix lui-même.
+// ============================================================
+
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const querystring = require('querystring');
+
+const DB_PATH = path.join(__dirname, 'SAAS-db.json');
+const PORT = process.env.PORT || 3000;
+
+// Les "connexions actives" : qui a le droit d'entrer dans quel tiroir.
+// (En mémoire : ça se vide si le serveur redémarre. Pour un vrai
+// site avec beaucoup de monde, on ferait ça autrement plus tard.)
+const sessions = {}; // token -> slug du commerçant
+const tentatives = {}; // adresse IP -> { nombre, depuis }
+const MAX_TENTATIVES = 5;
+const BLOCAGE_MS = 10 * 60 * 1000; // 10 minutes
+
+function adresseIP(req) {
+  return (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'inconnu').split(',')[0].trim();
+}
+
+function estBloque(ip) {
+  const t = tentatives[ip];
+  if (!t) return false;
+  if (Date.now() - t.depuis > BLOCAGE_MS) {
+    delete tentatives[ip];
+    return false;
+  }
+  return t.nombre >= MAX_TENTATIVES;
+}
+
+function enregistrerEchec(ip) {
+  const t = tentatives[ip] || { nombre: 0, depuis: Date.now() };
+  t.nombre += 1;
+  if (t.nombre === 1) t.depuis = Date.now();
+  tentatives[ip] = t;
+}
+
+function reinitialiserTentatives(ip) {
+  delete tentatives[ip];
+}
+
+// ------------------------------------------------------------
+// OUTILS : lire / écrire le "classeur" (la base de données JSON)
+// ------------------------------------------------------------
+function lireDB() {
+  const contenu = fs.readFileSync(DB_PATH, 'utf-8');
+  return JSON.parse(contenu);
+}
+
+function ecrireDB(db) {
+  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2), 'utf-8');
+}
+
+// ------------------------------------------------------------
+// OUTILS : mot de passe (on ne stocke JAMAIS le mot de passe en clair)
+// ------------------------------------------------------------
+function hacherMotDePasse(motDePasse, sel) {
+  return crypto.scryptSync(motDePasse, sel, 64).toString('hex');
+}
+
+function creerHachage(motDePasse) {
+  const sel = crypto.randomBytes(16).toString('hex');
+  const hash = hacherMotDePasse(motDePasse, sel);
+  return { sel, hash };
+}
+
+function verifierMotDePasse(motDePasse, sel, hashAttendu) {
+  const hash = hacherMotDePasse(motDePasse, sel);
+  return hash === hashAttendu;
+}
+
+// ------------------------------------------------------------
+// OUTILS : cookies (pour savoir "qui est connecté")
+// ------------------------------------------------------------
+function lireCookies(req) {
+  const header = req.headers.cookie || '';
+  const cookies = {};
+  header.split(';').forEach(paire => {
+    const [cle, valeur] = paire.trim().split('=');
+    if (cle) cookies[cle] = decodeURIComponent(valeur || '');
+  });
+  return cookies;
+}
+
+function slugDepuisRequete(req) {
+  const cookies = lireCookies(req);
+  const token = cookies.session;
+  if (token && sessions[token]) return sessions[token];
+  return null;
+}
+
+// ------------------------------------------------------------
+// PAGES HTML (le "code devant", ici sous forme de gabarits simples)
+// ------------------------------------------------------------
+function pageAccueil(hote) {
+  const lienDemo = `https://${hote}/menu/chez-brahim`;
+  const qrDemo = `https://api.qrserver.com/v1/create-qr-code/?size=260x260&data=${encodeURIComponent(lienDemo)}`;
+  return `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Menu QR Code — Le menu digital de votre commerce</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body class="fond-braise">
+  <main class="accueil">
+    <header class="accueil-nav">
+      <span class="accueil-marque">MENU<span class="point-ember">•</span>QR</span>
+      <a href="/login" class="lien-discret">Se connecter</a>
+    </header>
+
+    <section class="accueil-hero">
+      <div class="accueil-texte">
+        <span class="eyebrow">Menu digital pour commerçants</span>
+        <h1 class="accueil-titre">Votre carte,<br><em>un code à scanner.</em></h1>
+        <p class="accueil-sous-titre">
+          Fini les menus à réimprimer. Créez votre catalogue en ligne, obtenez votre QR code,
+          et changez vos prix en direct — depuis votre téléphone.
+        </p>
+        <div class="accueil-cta">
+          <a href="/signup" class="btn-primary">Créer mon menu — gratuit</a>
+          <a href="/login" class="lien-discret accueil-cta-secondaire">J'ai déjà un compte</a>
+        </div>
+        <a href="${lienDemo}" target="_blank" class="accueil-demo-lien">Voir un exemple de menu en ligne →</a>
+      </div>
+
+      <div class="accueil-ticket" aria-hidden="true">
+        <div class="ticket-tete">
+          <span class="ticket-eyebrow">Aperçu</span>
+          <span class="ticket-nom">Chez Vous</span>
+        </div>
+        <div class="ticket-rule"></div>
+        <ul class="ticket-liste">
+          <li><span>Plat du jour</span><i></i><b>1500 F</b></li>
+          <li><span>Jus de bissap</span><i></i><b>500 F</b></li>
+          <li><span>Brochette</span><i></i><b>1000 F</b></li>
+        </ul>
+        <div class="ticket-qr" aria-hidden="true">
+          <div class="qr-faux">
+            ${Array.from({length: 49}).map(() => `<span class="${Math.random() > 0.55 ? 'plein' : ''}"></span>`).join('')}
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="accueil-scan">
+      <div class="accueil-scan-texte">
+        <span class="eyebrow">Testez maintenant</span>
+        <h2>Scannez, vous y êtes.</h2>
+        <p>Ce QR code mène vers un vrai menu en ligne, hébergé sur ce SaaS. Scannez-le avec l'appareil photo de votre téléphone.</p>
+      </div>
+      <img src="${qrDemo}" alt="QR code de démonstration" width="180" height="180" class="accueil-scan-qr">
+    </section>
+
+    <section class="accueil-etapes">
+      <span class="eyebrow" style="display:block; text-align:center; margin-bottom:22px;">Comment ça marche</span>
+      <div class="etapes-grille">
+        <div class="etape"><span class="etape-num">1</span><h3>Crée ton menu</h3><p>Nom du commerce, mot de passe. Deux minutes.</p></div>
+        <div class="etape"><span class="etape-num">2</span><h3>Reçois ton QR code</h3><p>Généré automatiquement, prêt à imprimer.</p></div>
+        <div class="etape"><span class="etape-num">3</span><h3>Tes clients scannent</h3><p>Ils voient ta carte à jour, sur leur téléphone.</p></div>
+      </div>
+    </section>
+
+    <section class="accueil-tarifs">
+      <span class="eyebrow" style="display:block; text-align:center; margin-bottom:22px;">Tarifs</span>
+      <div class="tarifs-grille">
+        <div class="tarif-carte">
+          <h3>Gratuit</h3>
+          <p class="tarif-prix">0 F<span>/mois</span></p>
+          <p>Menu en ligne, QR code, jusqu'à 15 produits.</p>
+        </div>
+        <div class="tarif-carte tarif-carte-vedette">
+          <span class="tarif-badge">Populaire</span>
+          <h3>Pro</h3>
+          <p class="tarif-prix">2 500 F<span>/mois</span></p>
+          <p>Produits illimités, photos, catégories, statistiques.</p>
+        </div>
+        <div class="tarif-carte">
+          <h3>Business</h3>
+          <p class="tarif-prix">Sur devis</p>
+          <p>Plusieurs points de vente, accompagnement dédié.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="accueil-features">
+      <div class="feature-card">
+        <span class="eyebrow">Sur la table</span>
+        <h2>Un QR code, pas un catalogue papier</h2>
+        <p>Le client scanne, voit votre carte à jour, sans app à installer.</p>
+      </div>
+      <div class="feature-card">
+        <span class="eyebrow">Depuis votre téléphone</span>
+        <h2>Vos prix changent en direct</h2>
+        <p>Modifiez un plat, un prix, une rupture de stock — visible tout de suite.</p>
+      </div>
+      <div class="feature-card">
+        <span class="eyebrow">Sans engagement</span>
+        <h2>Créez votre compte en 2 minutes</h2>
+        <p>Aucune carte bancaire, aucun rendez-vous. Juste un nom et un mot de passe.</p>
+      </div>
+    </section>
+
+    <footer class="accueil-pied">
+      <a href="/signup" class="btn-primary">Créer mon menu maintenant</a>
+    </footer>
+  </main>
+</body>
+</html>`;
+}
+
+function pageLogin(erreur) {
+  return `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connexion commerçant</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body class="fond-braise">
+  <main class="auth-page">
+    <div class="auth-card">
+      <span class="eyebrow">Espace commerçant</span>
+      <h1>Connexion</h1>
+      ${erreur ? `<p class="form-error">${erreur}</p>` : ''}
+      <form method="POST" action="/login" class="stack">
+        <label>Identifiant
+          <input name="slug" required autocomplete="username">
+        </label>
+        <label>Mot de passe
+          <input type="password" name="motdepasse" required autocomplete="current-password">
+        </label>
+        <button type="submit" class="btn-primary">Se connecter</button>
+      </form>
+      <p class="lien-discret" style="margin-top:16px; text-align:center;">
+        Pas encore de compte ? <a href="/signup" style="color:inherit; text-decoration:underline;">Créer un compte</a>
+      </p>
+    </div>
+  </main>
+</body>
+</html>`;
+
+}
+
+function pageSignup(erreur) {
+  return `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Créer un compte commerçant</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body class="fond-braise">
+  <main class="auth-page">
+    <div class="auth-card">
+      <span class="eyebrow">Espace commerçant</span>
+      <h1>Créer un compte</h1>
+      ${erreur ? `<p class="form-error">${erreur}</p>` : ''}
+      <form method="POST" action="/signup" class="stack">
+        <label>Nom du commerce
+          <input name="nom" required placeholder="Ex: Chez Fatimé">
+        </label>
+        <label>Type d'activité
+          <select name="typeActivite">
+            <option value="restaurant">Restaurant / Maquis / Snack</option>
+            <option value="coiffure">Coiffure / Beauté</option>
+            <option value="hotel">Hôtel</option>
+            <option value="boutique">Boutique</option>
+            <option value="autre">Autre</option>
+          </select>
+        </label>
+        <label>Numéro Mobile Money (optionnel)
+          <input name="telephonePaiement" placeholder="Ex: 65 00 84 85">
+        </label>
+        <label>Mot de passe
+          <input type="password" name="motdepasse" required autocomplete="new-password" minlength="6">
+        </label>
+        <button type="submit" class="btn-primary">Créer mon compte</button>
+      </form>
+      <p class="lien-discret" style="margin-top:16px; text-align:center;">
+        Déjà un compte ? <a href="/login" style="color:inherit; text-decoration:underline;">Se connecter</a>
+      </p>
+    </div>
+  </main>
+</body>
+</html>`;
+}
+
+function pageDashboard(commercant, slug, hote, langue, messageMotDePasse) {
+  const t = TRAD_DASH[langue] || TRAD_DASH.fr;
+  const direction = langue === 'ar' ? 'rtl' : 'ltr';
+  const mot = motProduit(commercant.typeActivite, langue);
+  const motMaj = mot.charAt(0).toUpperCase() + mot.slice(1);
+  const indexActuel = ORDRE_LANGUES.indexOf(langue) === -1 ? 0 : ORDRE_LANGUES.indexOf(langue);
+  const autreLangue = ORDRE_LANGUES[(indexActuel + 1) % ORDRE_LANGUES.length];
+
+  const lienMenu = `https://${hote}/menu/${slug}`;
+  const urlQrCode = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(lienMenu)}`;
+  const lignesProduits = commercant.produits.map((p, i) => `
+    <form method="POST" action="/dashboard/update?lang=${langue}" class="ligne-produit ${p.disponible === false ? 'produit-epuise' : ''}">
+      <input type="hidden" name="index" value="${i}">
+      ${p.photo ? `<img src="${p.photo}" alt="" class="photo-apercu">` : ''}
+      <input name="nom" value="${p.nom}" required class="champ-nom">
+      <div class="champ-prix">
+        <input name="prix" type="number" value="${p.prix}" required>
+        <span>F</span>
+      </div>
+      <input name="categorie" value="${p.categorie || ''}" placeholder="${t.categorieOpt}" class="champ-photo">
+      <input name="photo" value="${p.photo || ''}" placeholder="${t.photoOpt}" class="champ-photo">
+      <label class="case-disponible">
+        <input type="checkbox" name="disponible" ${p.disponible === false ? '' : 'checked'}>
+        ${t.enStock}
+      </label>
+      <div class="ligne-actions">
+        <button type="submit" class="btn-mini btn-mini-save">${t.enregistrer}</button>
+        <button type="submit" formaction="/dashboard/delete?lang=${langue}" class="btn-mini btn-mini-delete">${t.supprimer}</button>
+      </div>
+    </form>`).join('');
+
+  return `<!DOCTYPE html>
+<html lang="${langue}" dir="${direction}">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${t.tableauDeBord} — ${commercant.nom}</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body class="fond-braise">
+  <main class="dash-page">
+    <header class="dash-head">
+      <div>
+        <span class="eyebrow">${t.tableauDeBord}</span>
+        <h1>${commercant.nom}</h1>
+      </div>
+      <div class="dash-head-droite">
+        <a class="lang-switch lang-switch-dash" href="/dashboard?lang=${autreLangue}" title="${NOMS_LANGUES[autreLangue]}">🌐 ${NOMS_LANGUES[langue] || 'FR'}</a>
+        <a href="/logout" class="lien-discret">${t.deconnexion}</a>
+      </div>
+    </header>
+
+    <a class="chip-lien" href="/menu/${slug}" target="_blank">
+      <span>${t.pagePublique}</span>
+      <strong>/menu/${slug}</strong>
+    </a>
+
+    <section class="dash-section">
+      <h2>${t.statistiques}</h2>
+      <p>${t.statsDesc}</p>
+      <div class="bloc-qrcode" style="text-align:left;">
+        <p style="font-size:2.2rem; font-weight:bold; margin:0;">${commercant.vues || 0}</p>
+        <p style="margin:4px 0 0; opacity:0.8;">${(commercant.vues || 0) > 1 ? t.vues : t.vue} ${t.auTotal}</p>
+      </div>
+    </section>
+
+    <section class="dash-section">
+      <h2>${t.tonQr}</h2>
+      <p>${t.tonQrDesc}</p>
+      <div class="bloc-qrcode">
+        <img src="${urlQrCode}" alt="QR code du menu de ${commercant.nom}" width="220" height="220">
+        <a href="${urlQrCode}" download="qrcode-${slug}.png" class="btn-primary" style="margin-top:12px; display:inline-block;">${t.telecharger}</a>
+      </div>
+    </section>
+
+    <section class="dash-section">
+      <h2>${t.qrTable}</h2>
+      <p>${t.qrTableDesc}</p>
+      <form method="GET" action="/dashboard/qr-table" class="stack">
+        <label>${t.nomTable}
+          <input name="nom" required placeholder="Table 1">
+        </label>
+        <button type="submit" class="btn-primary">${t.generer}</button>
+      </form>
+    </section>
+
+    <section class="dash-section">
+      <h2>${motMaj}s</h2>
+      <div class="liste-produits">
+        ${lignesProduits}
+      </div>
+    </section>
+
+    <section class="dash-section">
+      <h2>${t.ajouter} — ${mot}</h2>
+      <form method="POST" action="/dashboard/add?lang=${langue}" class="form-ajout">
+        <input name="nom" placeholder="${motMaj}" required>
+        <input name="prix" type="number" placeholder="${t.prixLabel}" required>
+        <input name="categorie" placeholder="${t.categorieOpt}">
+        <input name="photo" placeholder="${t.photoOpt}">
+        <button type="submit" class="btn-primary">${t.ajouter}</button>
+      </form>
+    </section>
+
+    <section class="dash-section">
+      <h2>${t.numeroMobile}</h2>
+      <p>${t.numeroMobileDesc}</p>
+      <form method="POST" action="/dashboard/telephone?lang=${langue}" class="stack">
+        <label>${t.numero}
+          <input name="telephonePaiement" value="${commercant.telephonePaiement || ''}" placeholder="Ex: 65 00 84 85">
+        </label>
+        <button type="submit" class="btn-primary">${t.enregistrer}</button>
+      </form>
+    </section>
+
+    <section class="dash-section">
+      <h2>${t.changerMdp}</h2>
+      ${messageMotDePasse ? `<p class="form-error" style="color:${messageMotDePasse.startsWith('Mot de passe modifié') || messageMotDePasse.startsWith('Password') || messageMotDePasse.includes('نجاح') ? 'var(--amber-400)' : 'var(--ember-500)'};">${messageMotDePasse}</p>` : ''}
+      <form method="POST" action="/dashboard/mot-de-passe?lang=${langue}" class="stack">
+        <label>${t.nouveauMdp}
+          <input type="password" name="motdepasse" required minlength="6" autocomplete="new-password">
+        </label>
+        <button type="submit" class="btn-primary">${t.mettreAJour}</button>
+      </form>
+    </section>
+  </main>
+</body>
+</html>`;
+}
+
+const TRADUCTIONS = {
+  fr: { menu: 'Menu', prix: 'Prix en Francs CFA', paiement: 'Paiement Mobile Money', commander: 'Commander' },
+  en: { menu: 'Menu', prix: 'Prices in CFA Francs', paiement: 'Mobile Money payment', commander: 'Order' },
+  ar: { menu: 'القائمة', prix: 'الأسعار بالفرنك الأفريقي', paiement: 'الدفع عبر موبايل موني', commander: 'اطلب' },
+};
+const ORDRE_LANGUES = ['fr', 'en', 'ar'];
+const NOMS_LANGUES = { fr: 'FR', en: 'EN', ar: 'AR' };
+
+// Vocabulaire du dashboard, selon la langue choisie
+const TRAD_DASH = {
+  fr: {
+    tableauDeBord: 'Tableau de bord', deconnexion: 'Se déconnecter', pagePublique: 'Page publique',
+    statistiques: 'Statistiques', statsDesc: 'Nombre de fois où des clients ont ouvert ton menu.',
+    vue: 'vue', vues: 'vues', auTotal: 'au total',
+    tonQr: 'Ton QR code', tonQrDesc: 'Les clients scannent ce code. Tu peux l\'imprimer.',
+    telecharger: 'Télécharger le QR code',
+    qrTable: 'QR code par table', qrTableDesc: 'Génère un QR code différent pour chaque table, le bar, ou "à emporter".',
+    nomTable: 'Nom (ex: Table 3, VIP, Bar)', generer: 'Générer ce QR code',
+    ajouter: 'Ajouter', enStock: 'En stock', enregistrer: 'Enregistrer', supprimer: 'Supprimer',
+    categorieOpt: 'Catégorie (optionnel)', photoOpt: 'Lien de la photo (optionnel)', prixLabel: 'Prix',
+    numeroMobile: 'Numéro Mobile Money', numeroMobileDesc: 'Affiché sur ton menu et pour la commande WhatsApp.',
+    numero: 'Numéro', changerMdp: 'Changer mon mot de passe', nouveauMdp: 'Nouveau mot de passe', mettreAJour: 'Mettre à jour',
+  },
+  en: {
+    tableauDeBord: 'Dashboard', deconnexion: 'Log out', pagePublique: 'Public page',
+    statistiques: 'Statistics', statsDesc: 'Number of times customers opened your menu.',
+    vue: 'view', vues: 'views', auTotal: 'total',
+    tonQr: 'Your QR code', tonQrDesc: 'Customers scan this code. You can print it.',
+    telecharger: 'Download the QR code',
+    qrTable: 'QR code per table', qrTableDesc: 'Generate a different QR code for each table, the bar, or "takeaway".',
+    nomTable: 'Name (e.g. Table 3, VIP, Bar)', generer: 'Generate this QR code',
+    ajouter: 'Add', enStock: 'In stock', enregistrer: 'Save', supprimer: 'Delete',
+    categorieOpt: 'Category (optional)', photoOpt: 'Photo link (optional)', prixLabel: 'Price',
+    numeroMobile: 'Mobile Money number', numeroMobileDesc: 'Shown on your menu and for WhatsApp ordering.',
+    numero: 'Number', changerMdp: 'Change my password', nouveauMdp: 'New password', mettreAJour: 'Update',
+  },
+  ar: {
+    tableauDeBord: 'لوحة التحكم', deconnexion: 'تسجيل الخروج', pagePublique: 'الصفحة العامة',
+    statistiques: 'الإحصائيات', statsDesc: 'عدد مرات فتح العملاء لقائمتك.',
+    vue: 'مشاهدة', vues: 'مشاهدات', auTotal: 'إجمالي',
+    tonQr: 'رمز الاستجابة السريعة الخاص بك', tonQrDesc: 'يقوم العملاء بمسح هذا الرمز. يمكنك طباعته.',
+    telecharger: 'تحميل رمز QR',
+    qrTable: 'رمز QR لكل طاولة', qrTableDesc: 'أنشئ رمز QR مختلف لكل طاولة أو البار أو "للطلبات الخارجية".',
+    nomTable: 'الاسم (مثال: طاولة 3، في آي بي، البار)', generer: 'إنشاء رمز QR',
+    ajouter: 'إضافة', enStock: 'متوفر', enregistrer: 'حفظ', supprimer: 'حذف',
+    categorieOpt: 'الفئة (اختياري)', photoOpt: 'رابط الصورة (اختياري)', prixLabel: 'السعر',
+    numeroMobile: 'رقم موبايل موني', numeroMobileDesc: 'يظهر في قائمتك ولطلبات واتساب.',
+    numero: 'الرقم', changerMdp: 'تغيير كلمة المرور', nouveauMdp: 'كلمة مرور جديدة', mettreAJour: 'تحديث',
+  },
+};
+
+// Vocabulaire du produit selon le type d'activité du commerçant
+const MOTS_ACTIVITE = {
+  restaurant: { fr: 'plat', en: 'dish', ar: 'طبق' },
+  coiffure:   { fr: 'prestation', en: 'service', ar: 'خدمة' },
+  hotel:      { fr: 'chambre', en: 'room', ar: 'غرفة' },
+  boutique:   { fr: 'article', en: 'item', ar: 'منتج' },
+  autre:      { fr: 'produit', en: 'product', ar: 'منتج' },
+};
+function motProduit(typeActivite, langue) {
+  const table = MOTS_ACTIVITE[typeActivite] || MOTS_ACTIVITE.autre;
+  return table[langue] || table.fr;
+}
+
+function pageMenuPublic(commercant, langue, table) {
+  const t = TRADUCTIONS[langue] || TRADUCTIONS.fr;
+  const indexActuel = ORDRE_LANGUES.indexOf(langue) === -1 ? 0 : ORDRE_LANGUES.indexOf(langue);
+  const autreLangue = ORDRE_LANGUES[(indexActuel + 1) % ORDRE_LANGUES.length];
+  const labelAutreLangue = NOMS_LANGUES[autreLangue];
+  const direction = langue === 'ar' ? 'rtl' : 'ltr';
+
+  // Numéro WhatsApp pour la commande (on réutilise le numéro Mobile Money, format international requis)
+  const numeroWhatsApp = (commercant.telephonePaiement || '').replace(/[^0-9]/g, '');
+  const precisionTable = table ? ` — ${table}` : '';
+
+  function ligneProduit(p) {
+    const epuise = p.disponible === false;
+    const messageWa = encodeURIComponent(`Bonjour, je veux commander : ${p.nom} (${p.prix} F)${precisionTable}`);
+    return `
+    <li class="menu-item ${epuise ? 'menu-item-epuise' : ''}">
+      ${p.photo ? `<img src="${p.photo}" alt="" class="menu-item-photo">` : ''}
+      <span class="item-nom">${p.nom}</span>
+      <span class="item-leader" aria-hidden="true"></span>
+      ${epuise
+        ? `<span class="item-epuise-tag">Épuisé</span>`
+        : `<span class="item-prix">${p.prix}<span class="item-devise"> F</span></span>
+           ${numeroWhatsApp ? `<a class="item-commander" href="https://wa.me/${numeroWhatsApp}?text=${messageWa}" target="_blank">${t.commander}</a>` : ''}`
+      }
+    </li>`;
+  }
+
+  // Regroupement par catégorie si les produits en ont une
+  const categories = {};
+  const sansCategorie = [];
+  commercant.produits.forEach(p => {
+    if (p.categorie) {
+      categories[p.categorie] = categories[p.categorie] || [];
+      categories[p.categorie].push(p);
+    } else {
+      sansCategorie.push(p);
+    }
+  });
+
+  let corpsListe = '';
+  if (Object.keys(categories).length === 0) {
+    corpsListe = `<ul class="menu-list">${sansCategorie.map(ligneProduit).join('')}</ul>`;
+  } else {
+    corpsListe = Object.entries(categories).map(([nomCat, produits]) => `
+      <h2 class="menu-categorie">${nomCat}</h2>
+      <ul class="menu-list">${produits.map(ligneProduit).join('')}</ul>`).join('');
+    if (sansCategorie.length) {
+      corpsListe += `<ul class="menu-list">${sansCategorie.map(ligneProduit).join('')}</ul>`;
+    }
+  }
+
+  return `<!DOCTYPE html>
+<html lang="${langue}" dir="${direction}">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${commercant.nom}</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body class="fond-braise">
+  <main class="menu-page">
+    <div class="menu-card">
+      <a class="lang-switch" href="?lang=${autreLangue}${table ? '&table=' + encodeURIComponent(table) : ''}">${labelAutreLangue}</a>
+      <header class="menu-head">
+        <span class="eyebrow">${t.menu}</span>
+        <h1>${commercant.nom}</h1>
+        ${table ? `<span class="menu-table-tag">${table}</span>` : ''}
+      </header>
+      <div class="grill-rule" aria-hidden="true"></div>
+      ${corpsListe}
+      <footer class="menu-foot">${t.prix}</footer>
+      ${commercant.telephonePaiement ? `<p class="menu-paiement">${t.paiement} : <strong>${commercant.telephonePaiement}</strong></p>` : ''}
+    </div>
+  </main>
+</body>
+</html>`;
+}
+
+function pageErreur(message, code) {
+  return `<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Erreur ${code}</title>
+  <link rel="stylesheet" href="/style.css"></head>
+  <body class="fond-braise"><main class="auth-page"><div class="auth-card">
+    <span class="eyebrow">Erreur ${code}</span>
+    <h1>${message}</h1>
+  </div></main></body></html>`;
+}
+
+// ------------------------------------------------------------
+// LE SERVEUR : qui répond à quelle adresse
+// ------------------------------------------------------------
+const serveur = http.createServer((req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const chemin = url.pathname;
+
+  // --- Fichier CSS statique ---
+  if (chemin === '/style.css') {
+    const css = fs.readFileSync(path.join(__dirname, 'SAAS-style.css'));
+    res.writeHead(200, { 'Content-Type': 'text/css' });
+    return res.end(css);
+  }
+
+  // --- Page publique du menu : CE LIEN VA DANS LE QR CODE ---
+  if (chemin.startsWith('/menu/') && req.method === 'GET') {
+    const slug = chemin.replace('/menu/', '');
+    const db = lireDB();
+    const commercant = db.commercants[slug];
+    if (!commercant) {
+      res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end(pageErreur('Ce commerçant n\'existe pas.', 404));
+    }
+    // On compte cette visite (statistiques simples)
+    commercant.vues = (commercant.vues || 0) + 1;
+    ecrireDB(db);
+    const langue = url.searchParams.get('lang') || 'fr';
+    const table = url.searchParams.get('table') || '';
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end(pageMenuPublic(commercant, langue, table));
+  }
+
+  // --- Formulaire de connexion ---
+  if (chemin === '/login' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end(pageLogin(null));
+  }
+
+  // --- Page d'inscription ---
+  if (chemin === '/signup' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end(pageSignup(null));
+  }
+
+  // --- Traitement de l'inscription ---
+  if (chemin === '/signup' && req.method === 'POST') {
+    let corps = '';
+    req.on('data', chunk => (corps += chunk));
+    req.on('end', () => {
+      const { nom, motdepasse, telephonePaiement, typeActivite } = querystring.parse(corps);
+
+      if (!nom || !motdepasse || motdepasse.length < 6) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end(pageSignup('Nom du commerce et mot de passe (6 caractères min.) requis.'));
+      }
+
+      // On transforme le nom en identifiant simple pour l'adresse (slug)
+      let slugBase = nom
+        .toLowerCase()
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // enlève les accents
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/(^-|-$)/g, '');
+      if (!slugBase) slugBase = 'commerce';
+
+      const db = lireDB();
+      let slug = slugBase;
+      let compteur = 2;
+      while (db.commercants[slug]) {
+        slug = `${slugBase}-${compteur}`;
+        compteur++;
+      }
+
+      const { sel, hash } = creerHachage(motdepasse);
+      db.commercants[slug] = {
+        nom,
+        sel,
+        motDePasseHash: hash,
+        telephonePaiement: telephonePaiement || '',
+        typeActivite: typeActivite || 'autre',
+        produits: [{ nom: 'Exemple de produit', prix: 1000 }],
+      };
+      ecrireDB(db);
+
+      const token = crypto.randomBytes(24).toString('hex');
+      sessions[token] = slug;
+      res.writeHead(302, {
+        'Set-Cookie': `session=${token}; HttpOnly; Path=/`,
+        Location: '/dashboard',
+      });
+      return res.end();
+    });
+    return;
+  }
+
+  // --- Traitement de la connexion ---
+  if (chemin === '/login' && req.method === 'POST') {
+    const ip = adresseIP(req);
+    if (estBloque(ip)) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end(pageLogin('Trop de tentatives. Réessaie dans quelques minutes.'));
+    }
+    let corps = '';
+    req.on('data', chunk => (corps += chunk));
+    req.on('end', () => {
+      const { slug, motdepasse } = querystring.parse(corps);
+      const db = lireDB();
+      const commercant = db.commercants[slug];
+
+      if (!commercant || !verifierMotDePasse(motdepasse, commercant.sel, commercant.motDePasseHash)) {
+        enregistrerEchec(ip);
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end(pageLogin('Identifiant ou mot de passe incorrect.'));
+      }
+
+      reinitialiserTentatives(ip);
+      const token = crypto.randomBytes(24).toString('hex');
+      sessions[token] = slug;
+      res.writeHead(302, {
+        'Set-Cookie': `session=${token}; HttpOnly; Path=/`,
+        Location: '/dashboard',
+      });
+      return res.end();
+    });
+    return;
+  }
+
+  // --- Déconnexion ---
+  if (chemin === '/logout') {
+    const cookies = lireCookies(req);
+    delete sessions[cookies.session];
+    res.writeHead(302, { 'Set-Cookie': 'session=; Path=/; Max-Age=0', Location: '/login' });
+    return res.end();
+  }
+
+  // --- Tableau de bord (protégé : il faut être connecté) ---
+  if (chemin === '/dashboard' && req.method === 'GET') {
+    const slug = slugDepuisRequete(req);
+    if (!slug) {
+      res.writeHead(302, { Location: '/login' });
+      return res.end();
+    }
+    const db = lireDB();
+    const langue = url.searchParams.get('lang') || 'fr';
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end(pageDashboard(db.commercants[slug], slug, req.headers.host, langue));
+  }
+
+  // --- Générer le QR code d'une table précise ---
+  if (chemin === '/dashboard/qr-table' && req.method === 'GET') {
+    const slug = slugDepuisRequete(req);
+    if (!slug) { res.writeHead(302, { Location: '/login' }); return res.end(); }
+    const nomTable = url.searchParams.get('nom') || '';
+    const lien = `https://${req.headers.host}/menu/${slug}?table=${encodeURIComponent(nomTable)}`;
+    const urlQr = `https://api.qrserver.com/v1/create-qr-code/?size=260x260&data=${encodeURIComponent(lien)}`;
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end(`<!DOCTYPE html>
+<html lang="fr">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QR code — ${nomTable}</title><link rel="stylesheet" href="/style.css"></head>
+<body class="fond-braise">
+  <main class="auth-page">
+    <div class="auth-card" style="text-align:center;">
+      <span class="eyebrow">${nomTable}</span>
+      <h1 style="margin-bottom:20px;">QR code de cette table</h1>
+      <img src="${urlQr}" alt="QR code ${nomTable}" width="260" height="260" style="border-radius:4px; border:6px solid var(--cream-100);">
+      <a href="${urlQr}" download="qrcode-${slug}-${nomTable}.png" class="btn-primary" style="display:block; margin-top:20px;">Télécharger</a>
+      <a href="/dashboard" class="lien-discret" style="display:block; margin-top:14px;">← Retour au tableau de bord</a>
+    </div>
+  </main>
+</body>
+</html>`);
+  }
+
+  // --- Modifier un produit existant ---
+  if (chemin === '/dashboard/update' && req.method === 'POST') {
+    const slug = slugDepuisRequete(req);
+    if (!slug) { res.writeHead(302, { Location: '/login' }); return res.end(); }
+    let corps = '';
+    req.on('data', chunk => (corps += chunk));
+    req.on('end', () => {
+      const { index, nom, prix, photo, categorie, disponible } = querystring.parse(corps);
+      const db = lireDB();
+      db.commercants[slug].produits[Number(index)] = { nom, prix: Number(prix), photo: photo || '', categorie: categorie || '', disponible: disponible === 'on' };
+      ecrireDB(db);
+      res.writeHead(302, { Location: `/dashboard?lang=${url.searchParams.get('lang') || 'fr'}` });
+      res.end();
+    });
+    return;
+  }
+
+  // --- Supprimer un produit ---
+  if (chemin === '/dashboard/delete' && req.method === 'POST') {
+    const slug = slugDepuisRequete(req);
+    if (!slug) { res.writeHead(302, { Location: '/login' }); return res.end(); }
+    let corps = '';
+    req.on('data', chunk => (corps += chunk));
+    req.on('end', () => {
+      const { index } = querystring.parse(corps);
+      const db = lireDB();
+      db.commercants[slug].produits.splice(Number(index), 1);
+      ecrireDB(db);
+      res.writeHead(302, { Location: `/dashboard?lang=${url.searchParams.get('lang') || 'fr'}` });
+      res.end();
+    });
+    return;
+  }
+
+  // --- Ajouter un produit ---
+  if (chemin === '/dashboard/add' && req.method === 'POST') {
+    const slug = slugDepuisRequete(req);
+    if (!slug) { res.writeHead(302, { Location: '/login' }); return res.end(); }
+    let corps = '';
+    req.on('data', chunk => (corps += chunk));
+    req.on('end', () => {
+      const { nom, prix, photo, categorie } = querystring.parse(corps);
+      const db = lireDB();
+      db.commercants[slug].produits.push({ nom, prix: Number(prix), photo: photo || '', categorie: categorie || '' });
+      ecrireDB(db);
+      res.writeHead(302, { Location: `/dashboard?lang=${url.searchParams.get('lang') || 'fr'}` });
+      res.end();
+    });
+    return;
+  }
+
+  // --- Changer son mot de passe ---
+  if (chemin === '/dashboard/mot-de-passe' && req.method === 'POST') {
+    const slug = slugDepuisRequete(req);
+    if (!slug) { res.writeHead(302, { Location: '/login' }); return res.end(); }
+    const langue = url.searchParams.get('lang') || 'fr';
+    let corps = '';
+    req.on('data', chunk => (corps += chunk));
+    req.on('end', () => {
+      const { motdepasse } = querystring.parse(corps);
+      const db = lireDB();
+      let message;
+      if (!motdepasse || motdepasse.length < 6) {
+        message = 'Le mot de passe doit faire au moins 6 caractères.';
+      } else {
+        const { sel, hash } = creerHachage(motdepasse);
+        db.commercants[slug].sel = sel;
+        db.commercants[slug].motDePasseHash = hash;
+        ecrireDB(db);
+        message = 'Mot de passe modifié avec succès.';
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end(pageDashboard(db.commercants[slug], slug, req.headers.host, langue, message));
+    });
+    return;
+  }
+
+  // --- Modifier le numéro Mobile Money ---
+  if (chemin === '/dashboard/telephone' && req.method === 'POST') {
+    const slug = slugDepuisRequete(req);
+    if (!slug) { res.writeHead(302, { Location: '/login' }); return res.end(); }
+    let corps = '';
+    req.on('data', chunk => (corps += chunk));
+    req.on('end', () => {
+      const { telephonePaiement } = querystring.parse(corps);
+      const db = lireDB();
+      db.commercants[slug].telephonePaiement = telephonePaiement || '';
+      ecrireDB(db);
+      res.writeHead(302, { Location: `/dashboard?lang=${url.searchParams.get('lang') || 'fr'}` });
+      return res.end();
+    });
+    return;
+  }
+
+  // --- Page d'accueil : présentation, avant de se connecter ---
+  if (chemin === '/') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end(pageAccueil(req.headers.host));
+  }
+
+  // --- Rien trouvé ---
+  res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(pageErreur('Page introuvable.', 404));
+});
+
+serveur.listen(PORT, () => {
+  console.log(`Serveur démarré : http://localhost:${PORT}`);
+  console.log(`Page de connexion : http://localhost:${PORT}/login`);
+});
+
+module.exports = { creerHachage }; // utilisé par creer-compte.js
