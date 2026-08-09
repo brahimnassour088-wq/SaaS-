@@ -1,0 +1,130 @@
+{
+  "commercants": {
+    "chez-brahim": {
+      "nom": "Chez Brahim",
+      "sel": "fb664c1d72cda2c79d625c97eacbd1dd",
+      "motDePasseHash": "8512ad5d30c1834e161bf2d8480edbbb2b6500ffc3219a8adbe8966e0e416f8296de3e8d03a4cc707d109dedb1a06ffa0af42306783ecfb6fb493777aa0e771a",
+      "produits": [
+        {
+          "nom": "Exemple de produit",
+          "prix": 1000
+        }
+      ]
+    },
+    "restaurant-le-sahel": {
+      "nom": "Restaurant Le Sahel",
+      "sel": "40df5ca320fc01a6a43531f05fa47b3a",
+      "motDePasseHash": "6c5d63ae1d4fce665c5a5a5d94df8d706b649b11afa280f7d2c7e01a15f3f28d453a517baad4342f8d7d749b16d13695426a771f2fd7e76848b81c643d04cde4",
+      "telephonePaiement": "65 00 84 85",
+      "typeActivite": "restaurant",
+      "email": "",
+      "dateInscription": "2026-08-09T15:44:24.627Z",
+      "plan": "avance",
+      "produits": [
+        {
+          "nom": "Poulet braisé",
+          "prix": 3500,
+          "categorie": "Plats",
+          "photo": "https://images.unsplash.com/photo-1598515214211-89d3c73ae83b?auto=format&fit=crop&w=600&q=80"
+        },
+        {
+          "nom": "Riz sauce arachide",
+          "prix": 2000,
+          "categorie": "Plats",
+          "photo": "https://images.unsplash.com/photo-1567620905732-2d1ec7ab7445?auto=format&fit=crop&w=600&q=80"
+        },
+        {
+          "nom": "Brochettes de bœuf",
+          "prix": 2500,
+          "categorie": "Plats",
+          "photo": "https://images.unsplash.com/photo-1529193591184-b1d58069ecdd?auto=format&fit=crop&w=600&q=80"
+        },
+        {
+          "nom": "Salade fraîche",
+          "prix": 1000,
+          "categorie": "Entrées",
+          "photo": "https://images.unsplash.com/photo-1512621776951-a57141f2eefd?auto=format&fit=crop&w=600&q=80"
+        },
+        {
+          "nom": "Jus de bissap",
+          "prix": 500,
+          "categorie": "Boissons",
+          "photo": "https://images.unsplash.com/photo-1544145945-f90425340c7e?auto=format&fit=crop&w=600&q=80"
+        },
+        {
+          "nom": "Café touba",
+          "prix": 500,
+          "categorie": "Boissons",
+          "photo": "https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?auto=format&fit=crop&w=600&q=80",
+          "heureDebut": "06:00",
+          "heureFin": "11:00"
+        },
+        {
+          "nom": "Beignets",
+          "prix": 300,
+          "categorie": "Entrées",
+          "photo": "https://images.unsplash.com/photo-1551024506-0bccd828d307?auto=format&fit=crop&w=600&q=80"
+        },
+        {
+          "nom": "Poisson braisé",
+          "prix": 3000,
+          "categorie": "Plats",
+          "photo": "https://images.unsplash.com/photo-1544025162-d76694265947?auto=format&fit=crop&w=600&q=80"
+        },
+        {
+          "nom": "Riz gras",
+          "prix": 2200,
+          "categorie": "Plats",
+          "photo": "https://images.unsplash.com/photo-1596797038530-2c107229654b?auto=format&fit=crop&w=600&q=80"
+        },
+        {
+          "nom": "Salade de fruits",
+          "prix": 1200,
+          "categorie": "Desserts",
+          "photo": "https://images.unsplash.com/photo-1490474418585-ba9bad8fd0ea?auto=format&fit=crop&w=600&q=80"
+        },
+        {
+          "nom": "Beignet sucré",
+          "prix": 400,
+          "categorie": "Desserts",
+          "photo": "https://images.unsplash.com/photo-1533910534207-90f31029a78e?auto=format&fit=crop&w=600&q=80"
+        },
+        {
+          "nom": "Thé à la menthe",
+          "prix": 500,
+          "categorie": "Boissons",
+          "photo": "https://images.unsplash.com/photo-1576092768241-dec231879fc3?auto=format&fit=crop&w=600&q=80"
+        }
+      ],
+      "vues": 3,
+      "derniereConnexion": "2026-08-09T15:44:30.772Z",
+      "avis": [
+        {
+          "note": 5,
+          "commentaire": "Le poulet braisé est excellent, j'ai commandé 3 fois cette semaine !",
+          "date": "2026-08-06T15:46:12.737Z"
+        },
+        {
+          "note": 5,
+          "commentaire": "Rapide et le QR code marche nickel, je recommande.",
+          "date": "2026-08-07T15:46:12.750Z"
+        },
+        {
+          "note": 4,
+          "commentaire": "Très bon riz gras, juste un peu long à midi.",
+          "date": "2026-08-08T15:46:12.750Z"
+        },
+        {
+          "note": 5,
+          "commentaire": "Le café touba du matin est top, j'y passe tous les jours avant le travail.",
+          "date": "2026-08-09T15:46:12.750Z"
+        },
+        {
+          "note": 5,
+          "commentaire": "Photos fidèles au produit, service impeccable.",
+          "date": "2026-08-09T15:46:12.750Z"
+        }
+      ]
+    }
+  }
+}
