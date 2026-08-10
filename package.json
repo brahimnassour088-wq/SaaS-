@@ -1,0 +1,11 @@
+{
+  "name": "saas-menu",
+  "version": "1.0.0",
+  "main": "SAAS-server-18.js",
+  "scripts": {
+    "start": "node SAAS-server-18.js"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
