@@ -74,12 +74,33 @@ const ECRAN_CHARGEMENT = `
 </script>`;
 
 // Les "connexions actives" : qui a le droit d'entrer dans quel tiroir.
-// (En mémoire : ça se vide si le serveur redémarre. Pour un vrai
-// site avec beaucoup de monde, on ferait ça autrement plus tard.)
-const sessions = {}; // token -> slug du commerçant
+// Persistées dans la base de données (SAAS-db.json) pour survivre aux
+// redémarrages du serveur (redéploiements) — avant, un simple redéploiement
+// déconnectait tout le monde du jour au lendemain.
+function persisterSessions() {
+  const db = lireDB();
+  db.sessions = sessions;
+  db.sessionsAdmin = sessionsAdmin;
+  ecrireDB(db);
+}
+function creerSessionsPersistantes(donneesInitiales) {
+  const cible = Object.assign({}, donneesInitiales || {});
+  return new Proxy(cible, {
+    set(t, prop, val) { t[prop] = val; persisterSessions(); return true; },
+    deleteProperty(t, prop) { delete t[prop]; persisterSessions(); return true; }
+  });
+}
+const DB_INITIALE = (function() {
+  try { return lireDB(); } catch (e) { return {}; }
+})();
+// Durée de vie des cookies de connexion (30 jours) — sans ça, le cookie
+// expire dès que le navigateur "oublie" la session (fermeture de l'appli
+// sur certains téléphones), et l'utilisateur doit se reconnecter à chaque fois.
+const DUREE_COOKIE = 60 * 60 * 24 * 30;
+const sessions = creerSessionsPersistantes(DB_INITIALE.sessions); // token -> slug du commerçant
 const ADMIN_SEL = '269592c380b72168b7d42276cd5f7816';
 const ADMIN_HASH = '0388a91afa731d5a8ae9d8e838ca4e704880b3016037799a5920d364ffe19ad124bb979ec8c6fb48aed0096bbdce94b34e0c25017408173bf679f395cd875bb6';
-const sessionsAdmin = {}; // token -> true
+const sessionsAdmin = creerSessionsPersistantes(DB_INITIALE.sessionsAdmin); // token -> true
 const tentatives = {}; // adresse IP -> { nombre, depuis }
 const avisEnvoyesAujourdhui = new Set(); // anti-spam simple : un avis par IP par commerçant par jour
 const messagesChatAujourdhui = new Map(); // anti-abus : compteur de messages chat par IP par commerçant par jour
@@ -130,6 +151,21 @@ function ecrireDB(db) {
 // ------------------------------------------------------------
 function hacherMotDePasse(motDePasse, sel) {
   return crypto.scryptSync(motDePasse, sel, 64).toString('hex');
+}
+
+// ------------------------------------------------------------
+// OUTILS : thème de couleur personnalisé par commerçant
+// ------------------------------------------------------------
+function assombrirCouleur(hex, pourcentage) {
+  const h = (hex || '#5B6EF5').replace('#', '');
+  const r = Math.max(0, parseInt(h.substring(0, 2), 16) - Math.round(255 * pourcentage));
+  const g = Math.max(0, parseInt(h.substring(2, 4), 16) - Math.round(255 * pourcentage));
+  const b = Math.max(0, parseInt(h.substring(4, 6), 16) - Math.round(255 * pourcentage));
+  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+}
+function styleThemeCommercant(couleur) {
+  const fonce = assombrirCouleur(couleur, 0.18);
+  return `--ember-500:${couleur}; --ember-600:${fonce}; --amber-400:${couleur};`;
 }
 
 function creerHachage(motDePasse) {
@@ -657,6 +693,31 @@ ${FAVICON}<link rel="stylesheet" href="/style.css">
 </html>`;
 }
 
+// Petit graphique en barres CSS (7 derniers jours) — pas besoin de librairie externe
+function graphiqueVues7Jours(vuesParJour, t) {
+  const jours = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    const cle = d.toISOString().slice(0, 10);
+    jours.push({ label: d.toLocaleDateString('fr-FR', { weekday: 'short' }), valeur: vuesParJour[cle] || 0 });
+  }
+  const max = Math.max(1, ...jours.map(j => j.valeur));
+  const barres = jours.map(j => `
+    <div style="display:flex; flex-direction:column; align-items:center; gap:6px; flex:1;">
+      <span style="font-size:0.75rem; opacity:0.75;">${j.valeur}</span>
+      <div style="width:100%; max-width:28px; height:70px; display:flex; align-items:flex-end; background:rgba(255,255,255,0.06); border-radius:6px; overflow:hidden;">
+        <div style="width:100%; height:${Math.max(4, Math.round((j.valeur / max) * 70))}px; background:linear-gradient(180deg, var(--ember-500), var(--ember-600)); border-radius:6px;"></div>
+      </div>
+      <span style="font-size:0.7rem; opacity:0.6; text-transform:capitalize;">${j.label}</span>
+    </div>`).join('');
+  return `
+    <div style="margin-top:18px;">
+      <p style="margin:0 0 10px; font-size:0.85rem; opacity:0.75;">${t.graphique7Jours || '7 derniers jours'}</p>
+      <div style="display:flex; gap:8px; align-items:flex-end;">${barres}</div>
+    </div>`;
+}
+
 function pageDashboard(commercant, slug, hote, langue, messageMotDePasse, limiteAtteinte) {
   const t = TRAD_DASH[langue] || TRAD_DASH.fr;
   const direction = langue === 'ar' ? 'rtl' : 'ltr';
@@ -768,6 +829,7 @@ ${FAVICON}<link rel="stylesheet" href="/style.css">
         <p style="font-size:2.2rem; font-weight:bold; margin:0;">${commercant.vues || 0}</p>
         <p style="margin:4px 0 0; opacity:0.8;">${(commercant.vues || 0) > 1 ? t.vues : t.vue} ${t.auTotal}</p>
       </div>
+      ${graphiqueVues7Jours(commercant.vuesParJour || {}, t)}
     </section>
 
     <section class="dash-section">
@@ -834,6 +896,15 @@ ${FAVICON}<link rel="stylesheet" href="/style.css">
           <input name="telephonePaiement" value="${commercant.telephonePaiement || ''}" placeholder="Ex: 65 00 84 85">
         </label>
         <button type="submit" class="btn-primary">${t.enregistrer}</button>
+      </form>
+    </section>
+
+    <section class="dash-section">
+      <h2>${t.themeTitre}</h2>
+      <p>${t.themeDesc}</p>
+      <form method="POST" action="/dashboard/theme?lang=${langue}" class="stack" style="flex-direction:row; align-items:center; gap:12px; flex-wrap:wrap;">
+        <input type="color" name="couleur" value="${commercant.couleurTheme || '#5B6EF5'}" style="width:56px; height:44px; border:none; border-radius:10px; background:none; cursor:pointer; padding:0;">
+        <button type="submit" class="btn-primary" style="margin:0;">${t.enregistrer}</button>
       </form>
     </section>
 
@@ -1106,6 +1177,8 @@ const TRAD_DASH = {
     ajouter: 'Ajouter', enStock: 'En stock', enregistrer: 'Enregistrer', supprimer: 'Supprimer',
     categorieOpt: 'Catégorie (optionnel)', photoOpt: 'Lien de la photo (optionnel)', prixLabel: 'Prix',
     numeroMobile: 'Numéro Mobile Money', numeroMobileDesc: 'Affiché sur ton menu et pour la commande WhatsApp.',
+    themeTitre: 'Couleur de ta page', themeDesc: 'Choisis la couleur qui représente le mieux ton commerce.',
+    graphique7Jours: '7 derniers jours',
     numero: 'Numéro', changerMdp: 'Changer mon mot de passe', nouveauMdp: 'Nouveau mot de passe', mettreAJour: 'Mettre à jour',
     disponibleDe: 'Visible de', horaireA: 'à', descriptionOpt: 'Description (optionnel)', genererIA: '✨ Générer avec l\'IA',
     stockLabel: 'Quantité en stock (optionnel)', stockRestant: 'en stock', stockRupture: 'Rupture de stock',
@@ -1127,6 +1200,8 @@ const TRAD_DASH = {
     ajouter: 'Add', enStock: 'In stock', enregistrer: 'Save', supprimer: 'Delete',
     categorieOpt: 'Category (optional)', photoOpt: 'Photo link (optional)', prixLabel: 'Price',
     numeroMobile: 'Mobile Money number', numeroMobileDesc: 'Shown on your menu and for WhatsApp ordering.',
+    themeTitre: 'Your page color', themeDesc: 'Pick the color that best represents your business.',
+    graphique7Jours: 'Last 7 days',
     numero: 'Number', changerMdp: 'Change my password', nouveauMdp: 'New password', mettreAJour: 'Update',
     disponibleDe: 'Visible from', horaireA: 'to', descriptionOpt: 'Description (optional)', genererIA: '✨ Generate with AI',
     stockLabel: 'Stock quantity (optional)', stockRestant: 'in stock', stockRupture: 'Out of stock',
@@ -1148,6 +1223,8 @@ const TRAD_DASH = {
     ajouter: 'إضافة', enStock: 'متوفر', enregistrer: 'حفظ', supprimer: 'حذف',
     categorieOpt: 'الفئة (اختياري)', photoOpt: 'رابط الصورة (اختياري)', prixLabel: 'السعر',
     numeroMobile: 'رقم موبايل موني', numeroMobileDesc: 'يظهر في قائمتك ولطلبات واتساب.',
+    themeTitre: 'لون صفحتك', themeDesc: 'اختر اللون الذي يمثل متجرك بشكل أفضل.',
+    graphique7Jours: 'آخر 7 أيام',
     numero: 'الرقم', changerMdp: 'تغيير كلمة المرور', nouveauMdp: 'كلمة مرور جديدة', mettreAJour: 'تحديث',
     disponibleDe: 'مرئي من', horaireA: 'إلى', descriptionOpt: 'الوصف (اختياري)', genererIA: '✨ إنشاء بالذكاء الاصطناعي',
     stockLabel: 'الكمية المتوفرة (اختياري)', stockRestant: 'متوفر', stockRupture: 'نفدت الكمية',
@@ -1282,7 +1359,7 @@ function pageMenuPublic(commercant, slug, langue, table, messageAvis) {
 <title>${commercant.nom}</title>
 ${FAVICON}<link rel="stylesheet" href="/style.css">
 </head>
-<body class="fond-braise">
+<body class="fond-braise"${commercant.couleurTheme ? ` style="${styleThemeCommercant(commercant.couleurTheme)}"` : ''}>
   ${ECRAN_CHARGEMENT}
   <main class="menu-page">
     <div class="menu-card">
@@ -1449,8 +1526,16 @@ const serveur = http.createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(pageErreur('Ce compte est momentanément en pause. Merci de contacter le commerçant.', 200));
     }
-    // On compte cette visite (statistiques simples)
+    // On compte cette visite (statistiques simples + historique par jour pour le graphique)
     commercant.vues = (commercant.vues || 0) + 1;
+    const aujourdHui = new Date().toISOString().slice(0, 10); // ex: "2026-08-23"
+    commercant.vuesParJour = commercant.vuesParJour || {};
+    commercant.vuesParJour[aujourdHui] = (commercant.vuesParJour[aujourdHui] || 0) + 1;
+    // On garde seulement les 30 derniers jours pour ne pas alourdir le fichier
+    const clesJours = Object.keys(commercant.vuesParJour).sort();
+    if (clesJours.length > 30) {
+      clesJours.slice(0, clesJours.length - 30).forEach(k => delete commercant.vuesParJour[k]);
+    }
     ecrireDB(db);
     const langue = url.searchParams.get('lang') || 'fr';
     const table = url.searchParams.get('table') || '';
@@ -1623,7 +1708,7 @@ const serveur = http.createServer((req, res) => {
       const token = crypto.randomBytes(24).toString('hex');
       sessions[token] = slug;
       res.writeHead(302, {
-        'Set-Cookie': `session=${token}; HttpOnly; Path=/`,
+        'Set-Cookie': `session=${token}; HttpOnly; Path=/; Max-Age=${DUREE_COOKIE}`,
         Location: '/dashboard',
       });
       return res.end();
@@ -1662,7 +1747,7 @@ const serveur = http.createServer((req, res) => {
       const token = crypto.randomBytes(24).toString('hex');
       sessions[token] = slug;
       res.writeHead(302, {
-        'Set-Cookie': `session=${token}; HttpOnly; Path=/`,
+        'Set-Cookie': `session=${token}; HttpOnly; Path=/; Max-Age=${DUREE_COOKIE}`,
         Location: '/dashboard',
       });
       return res.end();
@@ -1706,7 +1791,7 @@ const serveur = http.createServer((req, res) => {
       }
       const token = crypto.randomBytes(24).toString('hex');
       sessionsAdmin[token] = true;
-      res.writeHead(302, { 'Set-Cookie': `sessionAdmin=${token}; HttpOnly; Path=/`, Location: '/admin' });
+      res.writeHead(302, { 'Set-Cookie': `sessionAdmin=${token}; HttpOnly; Path=/; Max-Age=${DUREE_COOKIE}`, Location: '/admin' });
       return res.end();
     });
     return;
@@ -2162,6 +2247,24 @@ const serveur = http.createServer((req, res) => {
       const { telephonePaiement } = querystring.parse(corps);
       const db = lireDB();
       db.commercants[slug].telephonePaiement = telephonePaiement || '';
+      ecrireDB(db);
+      res.writeHead(302, { Location: `/dashboard?lang=${url.searchParams.get('lang') || 'fr'}` });
+      return res.end();
+    });
+    return;
+  }
+
+  if (chemin === '/dashboard/theme' && req.method === 'POST') {
+    const slug = slugDepuisRequete(req);
+    if (!slug) { res.writeHead(302, { Location: '/login' }); return res.end(); }
+    let corps = '';
+    req.on('data', chunk => (corps += chunk));
+    req.on('end', () => {
+      const { couleur } = querystring.parse(corps);
+      const db = lireDB();
+      // On valide que c'est bien un code hex (#RRGGBB) avant d'enregistrer
+      const couleurValide = /^#[0-9a-fA-F]{6}$/.test(couleur) ? couleur : '#5B6EF5';
+      db.commercants[slug].couleurTheme = couleurValide;
       ecrireDB(db);
       res.writeHead(302, { Location: `/dashboard?lang=${url.searchParams.get('lang') || 'fr'}` });
       return res.end();
